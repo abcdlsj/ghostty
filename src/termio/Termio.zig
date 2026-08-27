@@ -668,6 +668,81 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     self.processOutputLocked(buf);
 }
 
+/// Atomically replace the terminal and VT parser with a binary snapshot.
+///
+/// Decoding happens before the renderer lock is acquired, so malformed or
+/// incomplete snapshots leave the live terminal untouched. The final resize,
+/// terminal swap, continuation restore, and renderer invalidation share one
+/// critical section with normal output processing.
+pub fn restoreSnapshot(self: *Termio, buf: []const u8) !void {
+    if (buf.len == 0) return error.EmptySnapshot;
+
+    var source: std.Io.Reader = .fixed(buf);
+    var decoded = try terminalpkg.snapshot.decodeExact(
+        self.alloc,
+        global.io(),
+        &source,
+        .{ .max_continuation_bytes = buf.len },
+    );
+    defer decoded.deinit(self.alloc);
+
+    var restored = decoded.toOwned();
+    errdefer restored.deinit(self.alloc);
+
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    // The snapshot should already match the host-owned viewport because the
+    // host resizes the remote runtime before taking it. Reconcile here as a
+    // final atomic guard against a concurrent local layout change.
+    const grid_size = self.size.grid();
+    try restored.resize(self.alloc, .{
+        .cols = grid_size.columns,
+        .rows = grid_size.rows,
+        .cell_size_px = .{
+            .width = self.size.cell.width,
+            .height = self.size.cell.height,
+        },
+    });
+
+    const old_handler = &self.terminal_stream.handler;
+    const handler: StreamHandler = .{
+        .alloc = old_handler.alloc,
+        .termio_mailbox = old_handler.termio_mailbox,
+        .surface_mailbox = old_handler.surface_mailbox,
+        .renderer_state = old_handler.renderer_state,
+        .renderer_wakeup = old_handler.renderer_wakeup,
+        .renderer_mailbox = old_handler.renderer_mailbox,
+        .size = old_handler.size,
+        .terminal = &self.terminal,
+        .osc_color_report_format = old_handler.osc_color_report_format,
+        .clipboard_write = old_handler.clipboard_write,
+        .clipboard_write_limit = old_handler.clipboard_write_limit,
+        .enquiry_response = old_handler.enquiry_response,
+    };
+
+    var old_terminal = self.terminal;
+    self.terminal_stream.deinit();
+    self.terminal = restored;
+    restored = undefined;
+    self.terminal_stream = .init(.{
+        .allocator = self.alloc,
+        .handler = handler,
+    });
+
+    switch (decoded.continuation) {
+        .ground => {},
+        .bytes => |continuation| self.terminal_stream.nextSlice(continuation),
+    }
+
+    // The renderer may retain GPU-side cells from the placeholder terminal.
+    // A clear dirty flag makes the replacement a single complete frame.
+    self.terminal.flags.dirty.clear = true;
+    old_terminal.deinit(self.alloc);
+
+    self.terminal_stream.handler.queueRender() catch unreachable;
+}
+
 /// Process output from readdata but the lock is already held.
 fn processOutputLocked(self: *Termio, buf: []const u8) void {
     // Schedule a render. We can call this first because we have the lock.
