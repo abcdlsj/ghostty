@@ -1,0 +1,69 @@
+name: Build Warren GhosttyKit
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag, for example warren-ghosttykit-v1.0.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Ensure Metal toolchain
+        run: |
+          if ! xcrun -sdk macosx metal -v >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+
+      - name: Build universal GhosttyKit
+        run: >-
+          zig build
+          -Doptimize=ReleaseFast
+          -Demit-macos-app=false
+          -Dxcframework-target=universal
+          --summary failures
+
+      - name: Package Swift binary target
+        run: |
+          ARTIFACT="$RUNNER_TEMP/GhosttyKit.xcframework"
+          ARCHIVE="$ARTIFACT/macos-arm64_x86_64/ghostty-internal.a"
+          OUTPUT="$RUNNER_TEMP/GhosttyKit.xcframework.zip"
+
+          ditto macos/GhosttyKit.xcframework "$ARTIFACT"
+          mv "$ARCHIVE" "$ARTIFACT/macos-arm64_x86_64/libghostty.a"
+          plutil -replace AvailableLibraries.0.LibraryPath -string libghostty.a "$ARTIFACT/Info.plist"
+          plutil -replace AvailableLibraries.0.BinaryPath -string libghostty.a "$ARTIFACT/Info.plist"
+          xcrun strip -S -x "$ARTIFACT/macos-arm64_x86_64/libghostty.a"
+          perl -0pi -e 's/module GhosttyKit/module libghostty/' "$ARTIFACT/macos-arm64_x86_64/Headers/module.modulemap"
+          ditto -c -k --sequesterRsrc --keepParent "$ARTIFACT" "$OUTPUT"
+
+          nm -gU "$ARTIFACT/macos-arm64_x86_64/libghostty.a" | grep _ghostty_surface_restore_snapshot
+          lipo "$ARTIFACT/macos-arm64_x86_64/libghostty.a" -verify_arch arm64 x86_64
+          swift package compute-checksum "$OUTPUT" > "$RUNNER_TEMP/GhosttyKit.xcframework.checksum"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            "$RUNNER_TEMP/GhosttyKit.xcframework.zip" \
+            "$RUNNER_TEMP/GhosttyKit.xcframework.checksum" \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" \
+            --notes "Universal macOS GhosttyKit for Warren, built from $GITHUB_SHA."
