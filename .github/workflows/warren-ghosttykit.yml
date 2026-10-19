@@ -53,6 +53,7 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "$ARTIFACT" "$OUTPUT"
 
           nm -gU "$ARTIFACT/macos-arm64_x86_64/libghostty.a" | grep _ghostty_surface_restore_snapshot
+          nm -gU "$ARTIFACT/macos-arm64_x86_64/libghostty.a" | grep _ghostty_surface_terminal_grid
           lipo "$ARTIFACT/macos-arm64_x86_64/libghostty.a" -verify_arch arm64 x86_64
           swift package compute-checksum "$OUTPUT" > "$RUNNER_TEMP/GhosttyKit.xcframework.checksum"
 
