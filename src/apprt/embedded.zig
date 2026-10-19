@@ -2055,6 +2055,28 @@ pub const CAPI = struct {
         };
     }
 
+    /// Return the grid of the terminal state that output is parsed against.
+    ///
+    /// ghostty_surface_size reports the size the surface asked for. The IO
+    /// thread applies that size to the terminal later, while
+    /// ghostty_surface_write_buffer parses on the caller's thread, so a
+    /// host-managed surface can parse output against the old grid right after
+    /// ghostty_surface_set_size returns. A host that knows which output was
+    /// produced for which size waits until this grid matches before writing
+    /// output produced for the new size.
+    export fn ghostty_surface_terminal_grid(
+        surface: *Surface,
+        columns: *u16,
+        rows: *u16,
+    ) void {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+        const term = core_surface.renderer_state.terminal;
+        columns.* = @intCast(term.cols);
+        rows.* = @intCast(term.rows);
+    }
+
     /// Returns the PID of the foreground process for the surface PTY.
     export fn ghostty_surface_foreground_pid(surface: *Surface) u64 {
         return surface.core_surface.getProcessInfo(.foreground_pid) orelse 0;
